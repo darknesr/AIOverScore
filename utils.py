@@ -24,6 +24,8 @@ from config import LEAGUE_COL_NAME, RANDOM_SEED
 from autogluon.core.metrics import make_scorer
 from sklearn.metrics import brier_score_loss
 import warnings
+from config import MODEL_CONFIGS # Bu import'un fonksiyonun üzerinde bir yerde olduğundan emin olun
+
 
 
 
@@ -222,22 +224,28 @@ def calculate_relative_odds_features(df):
     return df_out, new_feature_names
 
 def calculate_rolling_features(df):
+    """
+    Takımların geçmiş performanslarına dayalı dinamik zaman serisi (rolling) özellikleri hesaplar.
+    Bu, bir takımın güncel formunu ölçmek için kritik öneme sahiptir.
+    """
     logging.info("Dinamik zaman serisi (rolling) özellikleri hesaplanıyor...")
     df_out = df.sort_values('dateth').copy()
     
+    # Takımların tüm maçlarını ev sahibi/deplasman ayrımı olmadan birleştir
     team_stats_base = pd.concat([
         df_out[['dateth', 'home', 'home_goals', 'away_goals']].rename(columns={'home': 'team', 'home_goals': 'goals_scored', 'away_goals': 'goals_conceded'}),
-        df_out[['dateth', 'away', 'home_goals', 'away_goals']].rename(columns={'away': 'team', 'away_goals': 'goals_scored', 'home_goals': 'goals_conceded'})
+        df_out[['dateth', 'away', 'away_goals', 'home_goals']].rename(columns={'away': 'team', 'away_goals': 'goals_scored', 'home_goals': 'goals_conceded'})
     ], ignore_index=True).sort_values(['team', 'dateth'])
     
+    # Temel metrikleri hesapla
     team_stats_base['goal_diff'] = team_stats_base['goals_scored'] - team_stats_base['goals_conceded']
     team_stats_base['is_win'] = (team_stats_base['goals_scored'] > team_stats_base['goals_conceded']).astype(int)
     team_stats_base['is_draw'] = (team_stats_base['goals_scored'] == team_stats_base['goals_conceded']).astype(int)
     team_stats_base['is_loss'] = (team_stats_base['goals_scored'] < team_stats_base['goals_conceded']).astype(int)
     
+    # Farklı zaman pencereleri ve istatistiksel operasyonlar
     windows = [3, 5, 10]
     stats_to_roll = ['goals_scored', 'goals_conceded', 'goal_diff', 'is_win', 'is_draw', 'is_loss']
-    
     rolling_operations = {'mean': 'avg', 'std': 'std', 'skew': 'skew', 'kurt': 'kurt', 'sum': 'sum'}
 
     grouped = team_stats_base.groupby('team')
@@ -246,36 +254,38 @@ def calculate_rolling_features(df):
     for stat in stats_to_roll:
         for w in windows:
             for op_func, op_name in rolling_operations.items():
+                # Gereksiz hesaplamaları atla (örn: galibiyetin ortalaması yerine toplamı daha anlamlı)
                 if (op_func == 'sum' and stat not in ['is_win', 'is_draw', 'is_loss']) or \
                    (op_func != 'sum' and stat in ['is_win', 'is_draw', 'is_loss']):
                     continue
 
                 col_name = f'roll_{w}_{op_name}_{stat}'
-                team_stats_base[col_name] = grouped[stat].transform(lambda x: x.shift(1).rolling(window=w, min_periods=1).__getattribute__(op_func)())
+                # .shift(1) ile veri sızıntısını önle (o maçtan önceki verileri kullan)
+                team_stats_base[col_name] = grouped[stat].transform(lambda x: x.shift(1).rolling(window=w, min_periods=w-2).agg(op_func))
                 new_rolling_features.append(col_name)
 
+    # Hesaplama sonrası geçici sütunları temizle
     team_stats_base.drop(columns=['goals_scored', 'goals_conceded', 'goal_diff', 'is_win', 'is_draw', 'is_loss'], inplace=True)
     
-    # Yeni özellik DataFrame'lerini oluştur
-    home_features_df = team_stats_base.rename(columns={'team': 'home'})
-    home_features_df.columns = ['dateth', 'home'] + [f'{c}_h' for c in new_rolling_features]
+    # Ev sahibi ve deplasman takımları için özellikleri ayır ve birleştir
+    home_features_df = team_stats_base.rename(columns={'team': 'home'}).add_prefix('h_')
+    away_features_df = team_stats_base.rename(columns={'team': 'away'}).add_prefix('a_')
 
-    away_features_df = team_stats_base.rename(columns={'team': 'away'})
-    away_features_df.columns = ['dateth', 'away'] + [f'{c}_a' for c in new_rolling_features]
-
-    # Ana DataFrame'e birleştir
-    df_out = df_out.merge(home_features_df, on=['dateth', 'home'], how='left')
-    df_out = df_out.merge(away_features_df, on=['dateth', 'away'], how='left')
+    df_out = df_out.merge(home_features_df, left_on=['dateth', 'home'], right_on=['h_dateth', 'h_home'], how='left')
+    df_out = df_out.merge(away_features_df, left_on=['dateth', 'away'], right_on=['a_dateth', 'a_away'], how='left')
 
     final_rolling_features = []
     for f_name in new_rolling_features:
-        h_feat = f_name + '_h'
-        a_feat = f_name + '_a'
+        h_feat = 'h_' + f_name
+        a_feat = 'a_' + f_name
         diff_feat = f_name + '_diff'
         df_out[diff_feat] = df_out[h_feat] - df_out[a_feat]
         final_rolling_features.extend([h_feat, a_feat, diff_feat])
 
-    df_out.fillna(0, inplace=True)
+    # Eksik değerleri doldur (sezon başı veya yeni takımlar için) ve gereksiz sütunları sil
+    df_out[final_rolling_features] = df_out[final_rolling_features].fillna(0)
+    df_out.drop(columns=[c for c in df_out.columns if c.startswith('h_dateth') or c.startswith('a_dateth') or c.startswith('h_home') or c.startswith('a_away')], inplace=True)
+    
     logging.info(f"{len(final_rolling_features)} adet rolling özellik oluşturuldu.")
     return df_out, final_rolling_features
 
@@ -359,47 +369,7 @@ def calculate_h2h_features(df):
     logging.info(f"{len(h2h_features_list)} adet H2H özellik oluşturuldu.")
     return df_out, h2h_features_list
 
-def calculate_league_features(df):
-    logging.info("Lig karakteristik özellikleri hesaplanıyor...")
-    df_out = df.sort_values('dateth').copy()
-    new_league_features = []
 
-    # Maç sonuçlarını kolayca toplamak için yeni sütunlar
-    df_out['is_home_win'] = (df_out['home_goals'] > df_out['away_goals']).astype(int)
-    df_out['is_away_win'] = (df_out['away_goals'] > df_out['home_goals']).astype(int)
-    df_out['is_draw'] = (df_out['home_goals'] == df_out['away_goals']).astype(int)
-    df_out['is_btts'] = ((df_out['home_goals'] > 0) & (df_out['away_goals'] > 0)).astype(int)
-    df_out['is_over_2_5'] = (df_out['total_goals'] > 2.5).astype(int) # Örnek olarak 2.5 üstü
-
-    # Yuvarlanacak/genişletilecek metrikler
-    metrics = {
-        'total_goals': ['mean', 'std'],
-        'is_home_win': ['mean'], # Ev sahibi galibiyet oranı
-        'is_away_win': ['mean'], # Deplasman galibiyet oranı
-        'is_draw': ['mean'],     # Beraberlik oranı
-        'is_btts': ['mean'],     # KG Var oranı
-        'is_over_2_5': ['mean']  # 2.5 Üstü oranı
-    }
-
-    grouped_by_league = df_out.groupby(LEAGUE_COL_NAME)
-
-    for metric, ops in metrics.items():
-        for op in ops:
-            col_name_prefix = f'league_{metric}_{op}'
-            # Uzun vadeli lig karakteristikleri için genişleyen ortalama/std
-            df_out[f'{col_name_prefix}_exp'] = grouped_by_league[metric].transform(lambda x: x.shift(1).expanding(min_periods=10).agg(op))
-            new_league_features.append(f'{col_name_prefix}_exp')
-
-            # Yakın zamandaki lig formu için yuvarlanan ortalama/std (örn. son 20 maç)
-            df_out[f'{col_name_prefix}_roll20'] = grouped_by_league[metric].transform(lambda x: x.shift(1).rolling(window=20, min_periods=5).agg(op))
-            new_league_features.append(f'{col_name_prefix}_roll20')
-
-    # Yeni ligler veya erken tarih için NaN değerleri doldur.
-    # Şimdilik 0 ile dolduruyoruz, ancak daha sonra global ortalamalarla doldurma düşünülebilir.
-    df_out[new_league_features] = df_out[new_league_features].fillna(0)
-
-    logging.info(f"{len(new_league_features)} adet lig karakteristik özelliği oluşturuldu.")
-    return df_out, new_league_features
 
 def calculate_league_features(df):
     logging.info("Lig karakteristik özellikleri hesaplanıyor...")
@@ -621,7 +591,7 @@ def add_interaction_features(df):
     logging.info(f"{len(new_interaction_features)} adet etkileşim özelliği oluşturuldu.")
     return df_out, new_interaction_features
 
-def calc_league_dynamic_thresholds(df: pd.DataFrame, league_col: str, prob_col: str, target_col: str, odds_col: str, min_bets: int = 15, default_thr: float = 0.75) -> dict:
+# def calc_league_dynamic_thresholds(df: pd.DataFrame, league_col: str, prob_col: str, target_col: str, odds_col: str, min_bets: int = 15, default_thr: float = 0.75) -> dict:
     """
     Her lig için ve global olarak, doğrudan karı maksimize eden en uygun bahis eşiğini hesaplar.
     """
@@ -668,6 +638,87 @@ def calc_league_dynamic_thresholds(df: pd.DataFrame, league_col: str, prob_col: 
     
     logging.info(f"Dinamik eşikler tamamlandı: {len(league_thresholds)-1} lige özel eşik + DEFAULT={league_thresholds['DEFAULT']}")
     return league_thresholds
+
+def calc_league_dynamic_thresholds(
+    df: pd.DataFrame, 
+    league_col: str, 
+    prob_col: str, 
+    target_col: str, 
+    odds_col: str, 
+    strategy: str = 'max_profit',
+    min_bets: int = 20, 
+    default_thr: float = 0.75,
+    conservative_thr: float = 0.75
+) -> dict:
+    """
+    Farklı stratejilere göre her lig için en uygun bahis eşiğini hesaplar.
+    Yeni Strateji: 'advanced_profit' - olasılık ve 'edge' değerini birleştirir.
+    """
+    logging.info(f"Dinamik eşikler '{strategy}' stratejisine göre hesaplanıyor...")
+    
+    df = df.copy() # Orijinal df'i bozmamak için kopyala
+    df.dropna(subset=[league_col, prob_col, target_col, odds_col], inplace=True)
+    
+    if strategy == 'conservative':
+        league_thresholds = {'DEFAULT': conservative_thr}
+        for lg in df[league_col].unique():
+            league_thresholds[lg] = conservative_thr
+        logging.info(f"Muhafazakar strateji seçildi. Tüm ligler için sabit eşik: {conservative_thr}")
+        return league_thresholds
+
+    # 'edge' değerini hesapla (sadece bu fonksiyon içinde kullanılacak)
+    df['edge'] = (df[prob_col] * df[odds_col]) - 1
+    
+    # Dengeli strateji için bir kalite skoru oluştur
+    if strategy == 'advanced_profit':
+        # Edge'in negatif olması durumu kaliteyi düşürmeli.
+        df['quality_score'] = (df[prob_col] * 0.70) + (df['edge'].clip(lower=0) * 0.30)
+    
+    def find_best_threshold(data, scope="Global"):
+        best_profit, best_thr = -1.0, None
+        
+        # Dengeli strateji, kalite skoruna göre bahis alır
+        if strategy == 'advanced_profit':
+            # Kalite skoru eşiklerini test et
+            for thr in np.arange(0.50, 0.96, 0.01):
+                # Bahis kararı: hem kalite skoru hem de min. olasılık şartı
+                bets = data[(data['quality_score'] >= thr) & (data[prob_col] > (1 / data[odds_col]))]
+                if len(bets) >= min_bets:
+                    profit = np.where(bets[target_col] == 1, bets[odds_col] - 1, -1).sum()
+                    if profit > best_profit:
+                        best_profit, best_thr = profit, thr
+            metric_type = "Kalite Skoru Eşiği"
+        else: # max_profit stratejisi
+            for thr in np.arange(0.50, 0.96, 0.01):
+                bets = data[data[prob_col] >= thr]
+                if len(bets) >= min_bets:
+                    profit = np.where(bets[target_col] == 1, bets[odds_col] - 1, -1).sum()
+                    if profit > best_profit:
+                        best_profit, best_thr = profit, thr
+            metric_type = "Olasılık Eşiği"
+
+        if best_profit > 0 and best_thr is not None:
+            logging.info(f"Kapsam: {scope} -> En İyi {metric_type}: {best_thr:.2f} (Kar: {best_profit:.2f})")
+            return round(best_thr, 2)
+        return None
+
+    global_default_threshold = find_best_threshold(df)
+    if global_default_threshold is None:
+        global_default_threshold = default_thr
+        logging.warning(f"Global olarak kârlı bir eşik bulunamadı. Sabit varsayılan ({default_thr}) kullanılacak.")
+
+    league_thresholds = {}
+    for lg, g in df.groupby(league_col):
+        if len(g) < min_bets * 2: continue
+        league_thr = find_best_threshold(g, scope=lg)
+        if league_thr is not None:
+            league_thresholds[lg] = league_thr
+            
+    league_thresholds['DEFAULT'] = global_default_threshold
+    
+    logging.info(f"'{strategy}' stratejisi tamamlandı: {len(league_thresholds)-1} lige özel eşik + DEFAULT={league_thresholds['DEFAULT']}")
+    return league_thresholds
+
 
 def prepare_data_for_ag(df):
     df_copy = df.copy()
@@ -760,19 +811,41 @@ profit_scorer = make_scorer(
 def run_performance_monitoring(predictions_df, matches_df, target_market='Over_2_5'):
     """
     Modelin geçmiş performansını izlemek için bir rapor oluşturur.
+    Bu versiyon, oranları ve skorları doğru bir şekilde birleştirir.
     """
-    logging.info("### PERFORMANS İZLEME RAPORU ###")
+    logging.info("### PERFORMANS İZLEME RAPORU (Riskli Stratejiye Göre) ###")
     
+    # Gerekli kolon adlarını config'den al
     odds_col = MODEL_CONFIGS[target_market]['odds_col']
     target_col = f'target_{target_market}'
-    prob_col = f'stacked_prob_{target_market.lower()}'
+    
+    # Tahmin olasılığı ve eşik kolon adlarını dinamik olarak al
+    prob_col = next((col for col in predictions_df.columns if 'predicted_probability' in col), None)
+    threshold_col = next((col for col in predictions_df.columns if 'threshold_profit' in col), None)
 
-    # Sonuçlanmış maçları al
-    merged_df = pd.merge(predictions_df, matches_df[['matchid', 'total_goals']], on='matchid', how='inner')
-    merged_df = merged_df.dropna(subset=['total_goals', prob_col])
+    if not prob_col or not threshold_col:
+        logging.error("Performans raporu için gerekli 'predicted_probability' veya 'threshold_profit' sütunları bulunamadı.")
+        return
+
+    # Tahmin verilerini, maç verileri (skor ve oranlar) ile birleştir
+    # matches_df'ten sadece gerekli kolonları alıyoruz.
+    required_match_cols = ['matchid', 'total_goals', odds_col]
+    
+    # matches_df'te bu kolonların var olduğundan emin ol
+    if not all(col in matches_df.columns for col in required_match_cols):
+        logging.error(f"Performans raporu için gerekli sütunlar (matchid, total_goals, {odds_col}) 'matches_df' içinde bulunamadı.")
+        return
+
+    merged_df = pd.merge(
+        predictions_df, 
+        matches_df[required_match_cols], 
+        on='matchid', 
+        how='inner' # Sadece eşleşen maçları al
+    )
+    merged_df.dropna(subset=['total_goals', prob_col, threshold_col, odds_col], inplace=True)
 
     if merged_df.empty:
-        logging.warning("İzlemek için sonuçlanmış tahmin bulunamadı.")
+        logging.warning("İzlemek için sonuçlanmış ve oranı bilinen tahmin bulunamadı.")
         return
 
     # Gerçekleşen sonucu (target) oluştur
@@ -780,8 +853,8 @@ def run_performance_monitoring(predictions_df, matches_df, target_market='Over_2
         goals = float(target_market.split('_')[1].replace(',', '.'))
         merged_df[target_col] = (merged_df['total_goals'] > goals).astype(int)
     
-    # Sadece bahis yapılan tahminleri filtrele
-    bets_df = merged_df[merged_df[prob_col] >= merged_df['guven_esigi']].copy()
+    # Sadece bahis yapılan tahminleri filtrele (riskli stratejiye göre)
+    bets_df = merged_df[merged_df[prob_col] >= merged_df[threshold_col]].copy()
     
     if bets_df.empty:
         logging.warning("Raporda gösterilecek bahis bulunamadı.")
@@ -806,4 +879,106 @@ def run_performance_monitoring(predictions_df, matches_df, target_market='Over_2
     logging.info(f"  - Toplam Kâr/Zarar: {total_profit:.2f} birim")
     logging.info(f"  - Yatırım Getirisi (ROI): {roi:.2f}%")
     logging.info(f"  - Brier Skoru (Kalibrasyon): {brier:.4f} (0'a ne kadar yakınsa o kadar iyi)")
-    logging.info("#######################################")
+    logging.info("############################################################")
+
+
+# YENİ FONKSİYON 1 (utils.py'a eklenecek)
+
+def calculate_volatility_features(df, windows=[5, 10]):
+    """
+    Takımların son maçlarındaki skor istikrarsızlığını (volatilitesini) hesaplar.
+    Yüksek volatilite, takımın tahmin edilemez olduğunu gösterir.
+    """
+    logging.info("Takım volatilite (istikrarsızlık) özellikleri hesaplanıyor...")
+    df_out = df.copy()
+    
+    # Bu özellik, 'goal_diff' sütununa ihtiyaç duyar
+    if 'home_goals' not in df_out.columns or 'away_goals' not in df_out.columns:
+        logging.warning("Volatilite hesaplaması için gol verileri eksik, bu adım atlanıyor.")
+        return df_out, []
+
+    # Takım bazında gol farklarını hesapla
+    team_matches_base = pd.concat([
+        df_out[['dateth', 'home', 'home_goals', 'away_goals']].rename(columns={'home': 'team', 'home_goals': 'goals_scored', 'away_goals': 'goals_conceded'}),
+        df_out[['dateth', 'away', 'away_goals', 'home_goals']].rename(columns={'away': 'team', 'away_goals': 'goals_scored', 'home_goals': 'goals_conceded'})
+    ], ignore_index=True).sort_values(['team', 'dateth'])
+    
+    team_matches_base['goal_diff'] = team_matches_base['goals_scored'] - team_matches_base['goals_conceded']
+
+    grouped = team_matches_base.groupby('team')['goal_diff']
+    new_volatility_features = []
+
+    for w in windows:
+        col_name = f'volatility_{w}_std'
+        team_matches_base[col_name] = grouped.transform(lambda x: x.shift(1).rolling(window=w, min_periods=w-2).std())
+        new_volatility_features.append(col_name)
+
+    # Özellikleri ana DataFrame'e birleştir
+    team_stats_merged = team_matches_base.drop(columns=['goals_scored', 'goals_conceded', 'goal_diff'])
+
+    home_features_df = team_stats_merged.rename(columns={'team': 'home'}).add_prefix('h_')
+    away_features_df = team_stats_merged.rename(columns={'team': 'away'}).add_prefix('a_')
+
+    df_out = df_out.merge(home_features_df, left_on=['dateth', 'home'], right_on=['h_dateth', 'h_home'], how='left')
+    df_out = df_out.merge(away_features_df, left_on=['dateth', 'away'], right_on=['a_dateth', 'a_away'], how='left')
+
+    final_feature_names = [f'h_{f}' for f in new_volatility_features] + [f'a_{f}' for f in new_volatility_features]
+    df_out[final_feature_names] = df_out[final_feature_names].fillna(0)
+    
+    # Gereksiz birleştirme sütunlarını temizle
+    df_out.drop(columns=[c for c in df_out.columns if c.startswith('h_dateth') or c.startswith('a_dateth') or c.startswith('h_home') or c.startswith('a_away')], inplace=True)
+
+    logging.info(f"{len(final_feature_names)} adet volatilite özelliği oluşturuldu.")
+    return df_out, final_feature_names
+
+# YENİ FONKSİYON 2 (utils.py'a eklenecek)
+
+def calculate_league_power_ranking(df):
+    """
+    Her bir lig içinde takımlar için ayrı bir Elo (Güç Sıralaması) hesaplar.
+    Bu, bir takımın kendi ligindeki nispi gücünü daha iyi ölçer.
+    """
+    logging.info("Lig içi güç sıralaması (League Elo) özellikleri hesaplanıyor...")
+    
+    all_league_elos = []
+    
+    # Her lig için ayrı ayrı Elo hesaplaması yap
+    for league_name, league_df in df.groupby('lleague'):
+        # Her lig için Elo hesaplaması sıfırdan başlar
+        elos = {} 
+        league_df_sorted = league_df.sort_values('dateth').copy()
+        home_elos, away_elos = [], []
+        
+        for index, row in league_df_sorted.iterrows():
+            h, a = row['home'], row['away']
+            h_elo, a_elo = elos.get(h, 1500), elos.get(a, 1500)
+            home_elos.append(h_elo)
+            away_elos.append(a_elo)
+            
+            if pd.notna(row['home_goals']):
+                e_home = 1 / (1 + 10**((a_elo - h_elo) / 400))
+                s_home = 0.5 if row['home_goals'] == row['away_goals'] else (1.0 if row['home_goals'] > row['away_goals'] else 0.0)
+                # Basit K-faktörü
+                k = 30 
+                elos[h] = h_elo + k * (s_home - e_home)
+                elos[a] = a_elo + k * ((1 - s_home) - (1 - e_home))
+        
+        league_df_sorted['league_home_elo'] = home_elos
+        league_df_sorted['league_away_elo'] = away_elos
+        all_league_elos.append(league_df_sorted[['matchid', 'league_home_elo', 'league_away_elo']])
+
+    if not all_league_elos:
+        return df, []
+        
+    # Tüm lig sonuçlarını birleştir
+    all_elos_df = pd.concat(all_league_elos)
+    
+    # Ana DataFrame'e birleştir
+    df_out = df.merge(all_elos_df, on='matchid', how='left')
+    df_out['league_elo_farki'] = df_out['league_home_elo'] - df_out['league_away_elo']
+    
+    new_features = ['league_home_elo', 'league_away_elo', 'league_elo_farki']
+    df_out[new_features] = df_out[new_features].fillna(1500) # Yeni takımlar için varsayılan
+
+    logging.info(f"{len(new_features)} adet lig içi Elo özelliği oluşturuldu.")
+    return df_out, new_features

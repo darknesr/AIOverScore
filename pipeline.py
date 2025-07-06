@@ -10,6 +10,8 @@ from autogluon.tabular import TabularPredictor
 from sklearn.preprocessing import LabelEncoder
 
 from .utils import (
+    calculate_league_power_ranking,
+    calculate_volatility_features,
     parse_score,
     generate_odds_features,
     apply_vig_filter,
@@ -91,6 +93,9 @@ def engineer_features(df, ELO_FİLE_PATH):
     df, league_features = calculate_league_features(df)
     df, team_strength_features = calculate_team_strength_ratings(df)
 
+    df, volatility_features = calculate_volatility_features(df)
+    df, league_elo_features = calculate_league_power_ranking(df)
+
     # Yeni: Oran Değişimi (Odds Movement) Özellikleri
     odds_movement_features = []
     o_cols = {c.replace('o_', '') for c in df.columns if c.startswith('o_')}
@@ -137,7 +142,9 @@ def engineer_features(df, ELO_FİLE_PATH):
         team_strength_features +
         interaction_features + # Yeni eklenen etkileşim özellikleri
         odds_movement_features + # Yeni eklenen oran değişimi özellikleri
-        ['edge']
+        ['edge'] + 
+        volatility_features +
+        league_elo_features # YENİ
     ))
     
     logging.info(f"Toplam {len(ALL_FEATURES)} adet özellik ile model eğitilecek.")
@@ -282,14 +289,77 @@ def run_stacking_workflow(df_train, df_predict, ALL_FEATURES, AG_MODELS_BASE_PAT
     train_results_for_thresholding = df_train.loc[raw_val.index].copy()
     train_results_for_thresholding[prob_col_name] = calibrated_train_probas_backtest
 
-    league_thr = calc_league_dynamic_thresholds(train_results_for_thresholding, league_col=LEAGUE_COL_NAME, prob_col=prob_col_name, target_col=meta_target_col, odds_col=main_odds_col)
+    # league_thr = calc_league_dynamic_thresholds(train_results_for_thresholding, league_col=LEAGUE_COL_NAME, prob_col=prob_col_name, target_col=meta_target_col, odds_col=main_odds_col)
 
-    results_df = df_predict.loc[meta_predict_df_full.index, ['matchid', 'league', LEAGUE_COL_NAME, 'home', 'away', 'dateth', main_odds_col]].copy()
-    results_df['guven_esigi'] = results_df[LEAGUE_COL_NAME].map(league_thr).fillna(league_thr['DEFAULT'])
+    # YENİ VE ÇİFT STRATEJİLİ HALİ
+
+    # --- EŞİK HESAPLAMA (İKİ FARKLI STRATEJİ İLE) ---
+
+    # 1. Strateji: 'conservative' (Bankocu)
+    # Yüksek isabet oranı hedefler, sadece modelin çok emin olduğu maçları seçer.
+    conservative_thresholds = calc_league_dynamic_thresholds(
+        train_results_for_thresholding, 
+        league_col=LEAGUE_COL_NAME, 
+        prob_col=prob_col_name, 
+        target_col=meta_target_col, 
+        odds_col=main_odds_col,
+        strategy='conservative' # Strateji: Muhafazakar
+    )
+
+    # 2. Strateji: 'max_profit' (Fırsatçı)
+    # Toplam kârı maksimize etmeye odaklanır, 'değer' (value) olan riskli maçları bulabilir.
+    profit_thresholds = calc_league_dynamic_thresholds(
+        train_results_for_thresholding, 
+        league_col=LEAGUE_COL_NAME, 
+        prob_col=prob_col_name, 
+        target_col=meta_target_col, 
+        odds_col=main_odds_col,
+        strategy='max_profit' # Strateji: Kâr Maksimizasyonu
+    )
+
+    # 3. Strateji: 'advanced_profit' (Dengeli Usta)
+    balanced_thresholds = calc_league_dynamic_thresholds(
+        train_results_for_thresholding, 
+        league_col=LEAGUE_COL_NAME, 
+        prob_col=prob_col_name, 
+        target_col=meta_target_col, 
+        odds_col=main_odds_col,
+        strategy='advanced_profit' # YENİ DENGELİ STRATEJİ
+    )
+
+    # --- SONUÇLARI HAZIRLAMA (İKİ EŞİK DEĞERİYLE) ---
+    results_df = df_predict.loc[meta_predict_df_full.index, ['matchid', 'league', LEAGUE_COL_NAME, 'home', 'away', 'dateth']].copy()
+    prob_col_name = f'stacked_prob_{MAIN_TARGET_MARKET.lower()}'
     results_df[prob_col_name] = final_stacked_probas_predict
+    
+    # İki farklı stratejinin eşiklerini ayrı sütunlara ekle
+    results_df['guven_esigi_garanti'] = results_df[LEAGUE_COL_NAME].map(conservative_thresholds).fillna(conservative_thresholds['DEFAULT'])
+    results_df['guven_esigi_riskli'] = results_df[LEAGUE_COL_NAME].map(profit_thresholds).fillna(profit_thresholds['DEFAULT'])
+    results_df['guven_esigi_dengeli'] = results_df[LEAGUE_COL_NAME].map(balanced_thresholds).fillna(balanced_thresholds['DEFAULT'])
+
+    results_df['edge'] = (results_df[prob_col_name] * df_predict[main_odds_col]) - 1
+    results_df['quality_score'] = (results_df[prob_col_name] * 0.70) + (results_df['edge'].clip(lower=0) * 0.30)
+
+
+    # Back-test için de benzer bir yapı kurulabilir ama şimdilik tahmin odaklı gidelim.
+    backtest_df = df_train.loc[raw_val.index, ['matchid', 'dateth', 'league', LEAGUE_COL_NAME]].copy()
+    backtest_df[prob_col_name] = calibrated_train_probas_backtest
+    # Back-test için de benzer bir yapı kurulabilir ama şimdilik tahmin odaklı gidelim.
+    backtest_df = df_train.loc[raw_val.index, ['matchid', 'dateth', 'league', LEAGUE_COL_NAME]].copy()
+    prob_col_name = f'stacked_prob_{MAIN_TARGET_MARKET.lower()}' # prob_col_name'i tekrar tanımla
+    backtest_df[prob_col_name] = calibrated_train_probas_backtest
+    backtest_df['guven_esigi'] = backtest_df[LEAGUE_COL_NAME].map(profit_thresholds).fillna(profit_thresholds['DEFAULT'])
+
+    # --- SONUÇLARI HAZIRLAMA (İKİ EŞİK DEĞERİYLE) ---
+    results_df = df_predict.loc[meta_predict_df_full.index, ['matchid', 'league', LEAGUE_COL_NAME, 'home', 'away', 'dateth']].copy()
+    results_df[prob_col_name] = final_stacked_probas_predict
+
+    # İki farklı stratejinin eşiklerini ayrı sütunlara ekle
+    results_df['guven_esigi_garanti'] = results_df[LEAGUE_COL_NAME].map(conservative_thresholds).fillna(conservative_thresholds['DEFAULT'])
+    results_df['guven_esigi_riskli'] = results_df[LEAGUE_COL_NAME].map(profit_thresholds).fillna(profit_thresholds['DEFAULT'])
 
     backtest_df = df_train.loc[raw_val.index, ['matchid', 'dateth', 'league', LEAGUE_COL_NAME, main_odds_col]].copy()
     backtest_df[prob_col_name] = calibrated_train_probas_backtest
-    backtest_df['guven_esigi'] = backtest_df[LEAGUE_COL_NAME].map(league_thr).fillna(league_thr['DEFAULT'])
+    backtest_df['guven_esigi'] = backtest_df[LEAGUE_COL_NAME].map(profit_thresholds).fillna(profit_thresholds['DEFAULT'])
 
-    return results_df, backtest_df, best_cal, league_thr
+    return results_df, backtest_df, best_cal, profit_thresholds

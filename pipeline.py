@@ -4,6 +4,7 @@ import numpy as np
 import sqlite3
 import os
 import pickle
+import shutil # BU SATIRI EKLEYİN
 from datetime import datetime
 from autogluon.tabular import TabularPredictor
 from sklearn.preprocessing import LabelEncoder
@@ -25,7 +26,9 @@ from .utils import (
     calc_league_dynamic_thresholds,
     prepare_data_for_ag,
     calculate_team_strength_ratings,
-    add_interaction_features # Yeni eklenen import
+    add_interaction_features, # Yeni eklenen import
+    select_features_by_importance, # YENİ
+    profit_scorer
 )
 from config import LEAGUE_COL_NAME, RANDOM_SEED, MAIN_TARGET_MARKET
 
@@ -143,7 +146,7 @@ def engineer_features(df, ELO_FİLE_PATH):
     return df_train, df_predict, ALL_FEATURES, fitters, updated_elos
 
 def run_stacking_workflow(df_train, df_predict, ALL_FEATURES, AG_MODELS_BASE_PATH, AG_PRESETS, AG_TIME_LIMIT_L1, AG_TIME_LIMIT_L2, CUSTOM_HYPERPARAMETERS, MODEL_CONFIGS):
-    logging.info("### 3. STACKING MODEL EĞİTİMİ VE TAHMİN ###")
+    logging.info("### 3. STACKING MODEL EĞİTİMİ VE TAHMİN (GELİŞTİRİLMİŞ) ###")
     os.makedirs(AG_MODELS_BASE_PATH, exist_ok=True)
     meta_features_train = pd.DataFrame(index=df_train.index)
     meta_features_predict = pd.DataFrame(index=df_predict.index)
@@ -152,16 +155,32 @@ def run_stacking_workflow(df_train, df_predict, ALL_FEATURES, AG_MODELS_BASE_PAT
     for model_name, config in MODEL_CONFIGS.items():
         target_col, problem_type = f"target_{model_name}", config['problem_type']
         if target_col not in df_train.columns: continue
-        
-        # Yinelenen sütunları engelle
+
         feature_cols = list(dict.fromkeys(ALL_FEATURES + ['time_decay_weight']))
         train_data_ag = df_train[feature_cols + [target_col]].dropna(subset=feature_cols + [target_col])
-        
+
         if len(train_data_ag) < 100: continue
-        
-        predictor_l1 = TabularPredictor(label=target_col, problem_type=problem_type, path=os.path.join(AG_MODELS_BASE_PATH, f"L1_Global_{model_name}"), eval_metric='roc_auc' if 'binary' in problem_type else 'accuracy')
+
+        # YENİ VE DOĞRU KOD
+        # Probleme göre doğru değerlendirme metriğini seç
+        if 'binary' in problem_type:
+            eval_metric = 'roc_auc'
+        elif 'multiclass' in problem_type:
+            # 'log_loss' çok sınıflı problemler için iyi bir başlangıç metriğidir
+            eval_metric = 'log_loss' 
+        else:
+            # Diğer problem tipleri için varsayılan
+            eval_metric = 'auto'
+
+        logging.info(f"'{model_name}' modeli için '{eval_metric}' metriği kullanılacak.")
+        predictor_l1 = TabularPredictor(
+            label=target_col, 
+            problem_type=problem_type, 
+            path=os.path.join(AG_MODELS_BASE_PATH, f"L1_Global_{model_name}"), 
+            eval_metric=eval_metric
+        )
         predictor_l1.fit(prepare_data_for_ag(train_data_ag), presets=AG_PRESETS, time_limit=AG_TIME_LIMIT_L1, hyperparameters=CUSTOM_HYPERPARAMETERS, ag_args_fit={'random_seed': RANDOM_SEED, 'sample_weight': 'time_decay_weight'})
-        
+
         preds_train_oof = predictor_l1.predict_proba(prepare_data_for_ag(train_data_ag.drop(columns=[target_col])))
         preds_predict = predictor_l1.predict_proba(prepare_data_for_ag(df_predict[feature_cols]))
 
@@ -171,30 +190,90 @@ def run_stacking_workflow(df_train, df_predict, ALL_FEATURES, AG_MODELS_BASE_PAT
         meta_features_train = meta_features_train.join(preds_train_oof)
         meta_features_predict = meta_features_predict.join(preds_predict)
 
-    # FAZ 2: META-MODEL (L2) EĞİTİMİ
-    logging.info("### FAZ 2: Meta-Model (L2) Eğitimi...")
+    # --- YENİ ADIM: ÖZELLİK SEÇİMİ ---
+    logging.info("### Meta-Model için Özellik Seçimi Yapılıyor... ###")
     meta_target_col = f"target_{MAIN_TARGET_MARKET}"
-    main_odds_col = MODEL_CONFIGS[MAIN_TARGET_MARKET]['odds_col']
-    
-    l2_extra_features = ['elo_farki', f'fair_prob_{main_odds_col}', f'rel_{main_odds_col}', 'edge'] # Edge özelliğini ekle
-    l2_final_features = [c for c in l2_extra_features if c in df_train.columns]
 
-    meta_train_df_full = pd.concat([meta_features_train, df_train[[meta_target_col] + l2_final_features]], axis=1).dropna(subset=meta_features_train.columns)
-    
+    # Özellik seçimi için eğitim setini hazırla
+    fs_train_df = pd.concat([meta_features_train, df_train[[meta_target_col]]], axis=1).dropna()
+
+    if len(fs_train_df) > 50:
+        # En önemli 75 özelliği seç
+        selected_meta_features = select_features_by_importance(
+            predictor=None, # utils'deki fonksiyon kendi predictor'ını oluşturacak
+            X=fs_train_df.drop(columns=[meta_target_col]),
+            y=fs_train_df[meta_target_col],
+            feature_count=75,
+            problem_type='binary'
+        )
+    else:
+        logging.warning("Özellik seçimi için yetersiz veri, tüm meta özellikler kullanılacak.")
+        selected_meta_features = meta_features_train.columns.tolist()
+
+    # FAZ 2: META-MODEL (L2) EĞİTİMİ (KÂRA ODAKLI)
+    logging.info(f"### FAZ 2: Meta-Model (L2) Eğitimi ({len(selected_meta_features)} özellik ile)... ###")
+    main_odds_col = MODEL_CONFIGS[MAIN_TARGET_MARKET]['odds_col']
+
+    # YENİ VE DOĞRU KOD
+    # Sadece df_train'de gerçekten var olan ek özellikleri seç
+    l2_extra_features = [c for c in ['elo_farki', f'fair_prob_{main_odds_col}', f'rel_{main_odds_col}', 'edge'] if c in df_train.columns]
+
+    # Meta-Modelin kullanacağı nihai özellik listesi (meta-özellikler + ek özellikler)
+    l2_final_features = selected_meta_features + l2_extra_features
+
+    # df_train'den SADECE ona ait olan sütunları seçerek bir liste oluştur
+    df_train_cols_to_select = [meta_target_col, main_odds_col] + l2_extra_features
+
+    # Şimdi verileri doğru yerlerden alarak birleştir:
+    # 1. L1 modellerinin ürettiği meta özellikleri al
+    # 2. df_train'den sadece yukarıda belirlediğimiz sütunları al
+    meta_train_df_full = pd.concat([meta_features_train, df_train[df_train_cols_to_select]], axis=1)
+
+    # Birleştirme sonrası, eksik veri içeren satırları temizle
+    meta_train_df_full.dropna(subset=l2_final_features, inplace=True)
+
     if len(meta_train_df_full) < 50:
         logging.error("Meta-modeli eğitmek için yeterli veri üretilemedi.")
-        return None, None, None, None, None, None
+        return None, None, None, None
 
-    predictor_l2 = TabularPredictor(label=meta_target_col, problem_type='binary', path=os.path.join(AG_MODELS_BASE_PATH, "L2_Meta_Model"), eval_metric='roc_auc')
-    meta_train_for_fit = prepare_data_for_ag(meta_train_df_full)
-    predictor_l2.fit(meta_train_for_fit, presets=AG_PRESETS, time_limit=AG_TIME_LIMIT_L2, ag_args_fit={'random_seed': RANDOM_SEED}, calibrate=False)
+    # L2 modelini eğitmeye başlamadan önce eski kalıntıları temizle
+    l2_model_path = os.path.join(AG_MODELS_BASE_PATH, "L2_Meta_Model")
+    if os.path.exists(l2_model_path):
+        logging.warning(f"Eski L2 model klasörü bulundu: '{l2_model_path}'. Temizleniyor...")
+        shutil.rmtree(l2_model_path)
 
-    meta_predict_df_full = pd.concat([meta_features_predict, df_predict[l2_final_features]], axis=1)
+    # Modeli, en iyi olasılık tahminlerini yapması için standart ve güvenilir bir metrikle eğitiyoruz.
+    # Kârlılık, olasılıklar elde edildikten sonra dinamik eşik belirleme adımında optimize edilecek.
+    predictor_l2 = TabularPredictor(
+        label=meta_target_col, 
+        problem_type='binary', 
+        path=l2_model_path, 
+        eval_metric='roc_auc'
+    )
+
+    # fit() fonksiyonuna sadece temel argümanları veriyoruz.
+    fit_kwargs = {
+        'presets': AG_PRESETS,
+        'time_limit': AG_TIME_LIMIT_L2,
+        'ag_args_fit': {'random_seed': RANDOM_SEED},
+        'calibrate': False, # Kalibrasyonu biz kendimiz yapıyoruz
+    }
+
+    # Modeli eğit
+    meta_train_for_fit = prepare_data_for_ag(meta_train_df_full[l2_final_features + [meta_target_col]])
+    predictor_l2.fit(meta_train_for_fit, **fit_kwargs)
+
+    # Tahminleri yap
+    # YENİ VE DOĞRU KOD
+    # Tahmin verisini birleştirirken, df_predict'ten SADECE ona ait olan
+    # 'l2_extra_features' sütunlarını alıyoruz.
+    meta_predict_df_full = pd.concat([meta_features_predict, df_predict[l2_extra_features]], axis=1)
     meta_predict_df_full = meta_predict_df_full.reindex(columns=meta_train_for_fit.drop(columns=[meta_target_col]).columns).fillna(0.5)
 
     raw_pred = predictor_l2.predict_proba(prepare_data_for_ag(meta_predict_df_full))[1]
     raw_val = predictor_l2.predict_proba(meta_train_for_fit.drop(columns=[meta_target_col]))[1]
 
+    # Kalibrasyon ve sonuçların hazırlanması (mevcut kod gibi devam)
     best_cal = get_robust_calibrator(raw_val.values, meta_train_for_fit[meta_target_col].values)
     final_stacked_probas_predict = best_cal.predict(raw_pred.values) 
     calibrated_train_probas_backtest = best_cal.predict(raw_val.values) 
@@ -202,14 +281,14 @@ def run_stacking_workflow(df_train, df_predict, ALL_FEATURES, AG_MODELS_BASE_PAT
     prob_col_name = f'stacked_prob_{MAIN_TARGET_MARKET.lower()}'
     train_results_for_thresholding = df_train.loc[raw_val.index].copy()
     train_results_for_thresholding[prob_col_name] = calibrated_train_probas_backtest
-    
+
     league_thr = calc_league_dynamic_thresholds(train_results_for_thresholding, league_col=LEAGUE_COL_NAME, prob_col=prob_col_name, target_col=meta_target_col, odds_col=main_odds_col)
 
-    results_df = df_predict.loc[meta_predict_df_full.index, ['matchid', 'league', LEAGUE_COL_NAME, 'home', 'away', 'dateth']].copy()
+    results_df = df_predict.loc[meta_predict_df_full.index, ['matchid', 'league', LEAGUE_COL_NAME, 'home', 'away', 'dateth', main_odds_col]].copy()
     results_df['guven_esigi'] = results_df[LEAGUE_COL_NAME].map(league_thr).fillna(league_thr['DEFAULT'])
     results_df[prob_col_name] = final_stacked_probas_predict
-    
-    backtest_df = df_train.loc[raw_val.index, ['matchid', 'dateth', 'league', LEAGUE_COL_NAME]].copy()
+
+    backtest_df = df_train.loc[raw_val.index, ['matchid', 'dateth', 'league', LEAGUE_COL_NAME, main_odds_col]].copy()
     backtest_df[prob_col_name] = calibrated_train_probas_backtest
     backtest_df['guven_esigi'] = backtest_df[LEAGUE_COL_NAME].map(league_thr).fillna(league_thr['DEFAULT'])
 

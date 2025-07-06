@@ -2,10 +2,12 @@ import logging
 import os
 import json
 import pickle
+import sqlite3
 import pandas as pd
 import shutil
 
 from src.pipeline import load_and_prepare_data, engineer_features, run_stacking_workflow
+from src.utils import run_performance_monitoring # YENİ
 from backtester import run_backtest_simulation # Modüler backtester import ediliyor
 from config import (
     DB_PATH, LOG_FILE, TIMESTAMP, AG_MODELS_BASE_PATH, ELO_FİLE_PATH, CSV_OUT,
@@ -83,6 +85,26 @@ if __name__ == "__main__":
                     with open(fname, 'wb') as f: pickle.dump(obj, f)
 
             logging.info(f"Tüm gerekli dosyalar predict.py için hazırlandı ve '{output_dir}' klasörüne yedeklendi.")
+
+            # --- YENİ ADIM: PERFORMANS RAPORUNU GÖSTER ---
+            # Veritabanından en son tahminleri ve maç sonuçlarını alarak rapor oluştur
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    # 'predictions' tablosundan son tahminleri çek
+                    # 'is_active=0' olanları da alabiliriz çünkü onlar sonuçlanmış olabilir
+                    recent_predictions = pd.read_sql_query("SELECT * FROM predictions ORDER BY dateth DESC LIMIT 500", conn)
+                    # Odds sütununu ekle (eğer veritabanında yoksa, 'results' DataFrame'inden alınabilir)
+                    # Bu örnekte results df'de olduğunu varsayıyoruz.
+                    if not results.empty and MODEL_CONFIGS[MAIN_TARGET_MARKET]['odds_col'] not in recent_predictions.columns:
+                        odds_col_name = MODEL_CONFIGS[MAIN_TARGET_MARKET]['odds_col']
+                        # Tahminlere oranları ekle
+                        recent_predictions = pd.merge(recent_predictions, results[['matchid', odds_col_name]], on='matchid', how='left')
+
+                # 'full_df' tüm maç verilerini içerir, bunu kullanabiliriz
+                run_performance_monitoring(recent_predictions, full_df, target_market=MAIN_TARGET_MARKET)
+            except Exception as e:
+                logging.error(f"Performans raporu oluşturulurken bir hata oluştu: {e}")
+
 
     except Exception as e:
         logging.critical("İş akışında beklenmedik bir hata oluştu!", exc_info=True)

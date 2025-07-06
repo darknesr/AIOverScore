@@ -21,6 +21,9 @@ except ImportError:
     BetaCalibration = None
 
 from config import LEAGUE_COL_NAME, RANDOM_SEED
+from autogluon.core.metrics import make_scorer
+from sklearn.metrics import brier_score_loss
+import warnings
 
 
 
@@ -670,3 +673,137 @@ def prepare_data_for_ag(df):
     df_copy = df.copy()
     df_copy[df_copy.select_dtypes(['object']).columns] = df_copy.select_dtypes(['object']).astype('category')
     return df_copy
+
+
+# YENİ VE DOĞRU KOD
+def select_features_by_importance(predictor, X, y, feature_count=75, problem_type='binary'):
+    """
+    Bir AutoGluon predictor kullanarak en önemli özellikleri seçer.
+    Modelin daha hızlı eğitilmesini ve gürültüden arınmasını sağlar.
+    """
+    logging.info(f"Özellik seçimi başlatıldı. Hedef: En önemli {feature_count} özellik.")
+    
+    # Gelen 'y' serisinin adını al (örn: 'target_Over_2_5')
+    label_column_name = y.name
+    
+    # Eğitim için X ve y'yi birleştir
+    training_data = pd.concat([X, y], axis=1)
+    
+    # Geçici bir predictor eğiterek özellik önemini al
+    # Uyarıları bastırarak çıktıyı temiz tut
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # TabularPredictor'a doğru etiket adını ver
+        temp_predictor = TabularPredictor(
+            label=label_column_name, 
+            problem_type=problem_type, 
+            verbosity=0
+        ).fit(training_data, presets='medium_quality')
+        
+    feature_importance_df = temp_predictor.feature_importance(data=training_data)
+    
+    # En önemli özellikleri seç
+    important_features = feature_importance_df.index[:feature_count].tolist()
+    
+    logging.info(f"Özellik seçimi tamamlandı. Seçilen {len(important_features)} özellik: {important_features}")
+    return important_features
+
+def kelly_criterion(probability, odds):
+    """Kelly Criterion formülüne göre bahis oranını hesaplar."""
+    b = odds - 1
+    p = probability
+    q = 1 - p
+    f_star = (b * p - q) / b
+    return max(0, f_star) # Negatif sonuçlar bahis yapılmayacağı anlamına gelir
+
+def profit_eval_metric(y_true, y_pred, **kwargs):
+    """
+    Kâra odaklı özel AutoGluon değerlendirme metriği.
+    Bu metrik, doğrudan bahis simülasyonu ile elde edilen kârı maksimize etmeye çalışır.
+    """
+    # y_pred genellikle bir DataFrame'dir, olasılık sütununu almamız gerekir.
+    # Genellikle pozitif sınıfın (örn: Over) olasılığı ikinci sütundadır.
+    if isinstance(y_pred, pd.DataFrame):
+        y_pred = y_pred.iloc[:, 1]
+        
+    df = kwargs['df'] # fit() fonksiyonuna eklediğimiz DataFrame'i alırız
+    odds_col = kwargs.get('odds_col', 'c_fto25_16') # Odds sütunu
+    
+    if odds_col not in df.columns:
+        raise ValueError(f"'{odds_col}' sütunu veride bulunamadı!")
+        
+    # Sadece y_true ile aynı indekse sahip satırları kullan
+    odds = df.loc[y_true.index, odds_col]
+    
+    # Basit bir strateji: Olasılık > 1/oran ise bahis yap (pozitif EV)
+    bets = y_pred > (1 / odds)
+    
+    profit = 0
+    if bets.any():
+        correct_bets = (y_true[bets] == 1)
+        incorrect_bets = (y_true[bets] == 0)
+        
+        profit += (odds[bets][correct_bets] - 1).sum() # Kazanan bahisler
+        profit -= incorrect_bets.sum() # Kaybeden bahisler
+        
+    # AutoGluon'un maksimize etmesi için pozitif bir değer döndür
+    return profit
+
+# AutoGluon için özel skorlayıcıyı oluştur
+profit_scorer = make_scorer(
+    name='profit_eval_metric',
+    score_func=profit_eval_metric,
+    optimum=1, # Hedefimiz maksimize etmek olduğu için 1
+    greater_is_better=True
+)
+
+def run_performance_monitoring(predictions_df, matches_df, target_market='Over_2_5'):
+    """
+    Modelin geçmiş performansını izlemek için bir rapor oluşturur.
+    """
+    logging.info("### PERFORMANS İZLEME RAPORU ###")
+    
+    odds_col = MODEL_CONFIGS[target_market]['odds_col']
+    target_col = f'target_{target_market}'
+    prob_col = f'stacked_prob_{target_market.lower()}'
+
+    # Sonuçlanmış maçları al
+    merged_df = pd.merge(predictions_df, matches_df[['matchid', 'total_goals']], on='matchid', how='inner')
+    merged_df = merged_df.dropna(subset=['total_goals', prob_col])
+
+    if merged_df.empty:
+        logging.warning("İzlemek için sonuçlanmış tahmin bulunamadı.")
+        return
+
+    # Gerçekleşen sonucu (target) oluştur
+    if 'Over' in target_market:
+        goals = float(target_market.split('_')[1].replace(',', '.'))
+        merged_df[target_col] = (merged_df['total_goals'] > goals).astype(int)
+    
+    # Sadece bahis yapılan tahminleri filtrele
+    bets_df = merged_df[merged_df[prob_col] >= merged_df['guven_esigi']].copy()
+    
+    if bets_df.empty:
+        logging.warning("Raporda gösterilecek bahis bulunamadı.")
+        return
+
+    # Performans metriklerini hesapla
+    num_bets = len(bets_df)
+    correct_bets = (bets_df[target_col] == 1).sum()
+    accuracy = (correct_bets / num_bets) * 100 if num_bets > 0 else 0
+    
+    # Kâr/Zarar Hesaplaması
+    bets_df['profit'] = np.where(bets_df[target_col] == 1, bets_df[odds_col] - 1, -1)
+    total_profit = bets_df['profit'].sum()
+    roi = (total_profit / num_bets) * 100 if num_bets > 0 else 0
+
+    # Brier Skoru (olasılık tahminlerinin kalibrasyonunu ölçer, düşük daha iyi)
+    brier = brier_score_loss(bets_df[target_col], bets_df[prob_col])
+    
+    # Raporu yazdır
+    logging.info(f"Son {num_bets} Bahis Üzerinden Performans:")
+    logging.info(f"  - İsabet Oranı: {accuracy:.2f}% ({correct_bets}/{num_bets})")
+    logging.info(f"  - Toplam Kâr/Zarar: {total_profit:.2f} birim")
+    logging.info(f"  - Yatırım Getirisi (ROI): {roi:.2f}%")
+    logging.info(f"  - Brier Skoru (Kalibrasyon): {brier:.4f} (0'a ne kadar yakınsa o kadar iyi)")
+    logging.info("#######################################")
